@@ -46,6 +46,7 @@ from equinox import Module, field, tree_at
 from jax import lax, random
 from jax import numpy as jnp
 from jax.scipy.special import gammaln, logsumexp
+from jax.scipy.linalg import solve_triangular
 from jaxtyping import Array, Bool, Float32, Int32, Integer, Key, Shaped, UInt
 
 from bartz import grove
@@ -171,6 +172,8 @@ class State(Module):
         The error variance. `None` in binary regression.
     sigma2_cov
         The error covariance matrix, in multivariate responses case.
+    sigma2_cov_prec
+        The inverse of error covariance matrix, in multivariate responses cases
     prec_scale
         The scale on the error precision, i.e., ``1 / error_scale ** 2``.
         `None` in binary regression.
@@ -192,6 +195,7 @@ class State(Module):
     resid: Float32[Array, ' n k']
     sigma2: Float32[Array, ''] | None
     sigma2_cov: Float32[Array, 'k k'] | None  # For error covariance
+    sigma2_cov_prec: Float32[Array, 'k k'] | None  # For error covariance
     prec_scale: Float32[Array, ' n'] | None
     sigma2_alpha: Float32[Array, ''] | None
     sigma2_beta: Float32[Array, ''] | None
@@ -215,6 +219,8 @@ def init(
     sigma2_cov_prior_df: Float32[Array, '']
     | None = None,  # for error covariance, inverse wishard prior
     sigma2_cov_prior_scale: Float32[Array, 'k k']
+    | None = None,  # for error covariance, inverse wishard prior
+    inv_sigma2_cov_prior_scale: Float32[Array, 'k k']
     | None = None,  # for error covariance, inverse wishard prior
     error_scale: Float32[Any, ' n'] | None = None,
     min_points_per_decision_node: int | Integer[Any, ''] | None = None,
@@ -356,7 +362,7 @@ def init(
         sigma2 = None
     else:
         sigma2_cov = sigma2_cov_prior_scale / (sigma2_cov_prior_df - k - 1)
-        # sigma2_cov_inv = inv(sigma2_cov_prior_scale) * sigma2_cov_prior_df
+        sigma2_cov_prec = inv_sigma2_cov_prior_scale * sigma2_cov_prior_df
         sigma2_alpha = jnp.asarray(sigma2_alpha)
         sigma2_beta = jnp.asarray(sigma2_beta)
         sigma2 = sigma2_beta / sigma2_alpha
@@ -387,6 +393,7 @@ def init(
         resid=jnp.zeros(y.shape) if is_binary else y - offset,
         sigma2=sigma2,
         sigma2_cov=sigma2_cov,
+        sigma2_cov_prec =sigma2_cov_prec,
         prec_scale=(
             None if error_scale is None else lax.reciprocal(jnp.square(error_scale))
         ),
@@ -512,7 +519,7 @@ def step(key: Key[Array, ''], bart: State) -> State:
         return step_z(keys.pop(), bart)
     elif bart.y.shape[1] > 1:  # Multivariate continuous regression
         bart = step_trees(keys.pop(), bart)
-        return step_sigma2_cov(keys.pop(), bart)
+        return step_sigma2_prec(keys.pop(), bart)
     else:  # continuous regression
         bart = step_trees(keys.pop(), bart)
         return step_sigma(keys.pop(), bart)
@@ -1688,7 +1695,8 @@ def accept_moves_parallel_stage(
     assert sigma is not None  # `step` shall temporarily set it to 1
     prelkv, prelk = precompute_likelihood_terms(
         bart.sigma2,
-        bart.sigma2_cov,
+        # bart.sigma2_cov,
+        bart.sigma2_cov_prec,
         bart.forest.sigma_mu2,
         bart.forest.sigma_mu2_cov,
         move_precs,
@@ -1697,7 +1705,8 @@ def accept_moves_parallel_stage(
         key,
         prec_trees,
         bart.sigma2,
-        bart.sigma2_cov,
+        # bart.sigma2_cov,
+        bart.sigma2_cov_prec,
         bart.forest.sigma_mu2,
         bart.forest.sigma_mu2_cov,
     )
@@ -2081,7 +2090,8 @@ def precompute_likelihood_terms_univariate(
 
 
 def precompute_likelihood_terms_multivariate(
-    sigma2_cov: Float32[Array, 'k k'],
+    # sigma2_cov: Float32[Array, 'k k'],
+    sigma2_cov_prec: Float32[Array, 'k k'],
     leaf_prior_cov: Float32[Array, 'k k'],
     move_precs: Counts,
 ) -> tuple[PreLkV, PreLk]:
@@ -2090,12 +2100,13 @@ def precompute_likelihood_terms_multivariate(
     """
     leaf_prior_cov = jnp.atleast_2d(leaf_prior_cov)
 
-    inv_Sigma = jnp.linalg.inv(sigma2_cov)  # (k,k)
+    # inv_Sigma = jnp.linalg.inv(sigma2_cov)  # (k,k)
+    inv_Sigma = sigma2_cov_prec
     inv_prior = jnp.linalg.inv(leaf_prior_cov)  # (k,k)
 
-    nL = move_precs.left.astype(sigma2_cov.dtype)[..., None, None]
-    nR = move_precs.right.astype(sigma2_cov.dtype)[..., None, None]
-    nT = move_precs.total.astype(sigma2_cov.dtype)[..., None, None]
+    nL = move_precs.left.astype(inv_Sigma.dtype)[..., None, None]
+    nR = move_precs.right.astype(inv_Sigma.dtype)[..., None, None]
+    nT = move_precs.total.astype(inv_Sigma.dtype)[..., None, None]
 
     A_left = nL * inv_Sigma + inv_prior  # (...,k,k)
     A_right = nR * inv_Sigma + inv_prior
@@ -2104,22 +2115,25 @@ def precompute_likelihood_terms_multivariate(
     Ai_right = jnp.linalg.inv(A_right)
     Ai_total = jnp.linalg.inv(A_total)
 
-    sigma2_left = nL * leaf_prior_cov + sigma2_cov
-    sigma2_right = nR * leaf_prior_cov + sigma2_cov
-    sigma2_total = nT * leaf_prior_cov + sigma2_cov
+    # sigma2_left = nL * leaf_prior_cov + sigma2_cov
+    # sigma2_right = nR * leaf_prior_cov + sigma2_cov
+    # sigma2_total = nT * leaf_prior_cov + sigma2_cov
+    sigma2_left = jnp.linalg.inv(inv_Sigma + inv_prior / nL)
+    sigma2_right = jnp.linalg.inv(inv_Sigma + inv_prior / nR)
+    sigma2_total = jnp.linalg.inv(inv_Sigma + inv_prior / nT)
 
     logdet = lambda M: jnp.linalg.slogdet(M)[1]
     sqrt_term = 0.5 * (
-        logdet(sigma2_cov)
+        logdet(inv_Sigma*nT/(nR*nL))
         + logdet(sigma2_total)
         - logdet(sigma2_left)
         - logdet(sigma2_right)
     )  # shape (num_trees,)
 
     prelkv = PreLkV(
-        sigma2_left=inv_Sigma @ leaf_prior_cov @ jnp.linalg.inv(sigma2_left),
-        sigma2_right=inv_Sigma @ leaf_prior_cov @ jnp.linalg.inv(sigma2_right),
-        sigma2_total=inv_Sigma @ leaf_prior_cov @ jnp.linalg.inv(sigma2_total),
+        sigma2_left=inv_Sigma @ sigma2_left @ inv_Sigma,
+        sigma2_right=inv_Sigma @ sigma2_right @ inv_Sigma,
+        sigma2_total=inv_Sigma @ sigma2_total @ inv_Sigma,
         sqrt_term=sqrt_term,
     )
 
@@ -2127,25 +2141,28 @@ def precompute_likelihood_terms_multivariate(
 
     return prelkv, prelk
 
+
 def precompute_likelihood_terms(
     sigma2: Float32[Array, ''] | None,
-    sigma2_cov: Float32[Array, 'k k'] | None,
+    # sigma2_cov: Float32[Array, 'k k'] | None,
+    sigma2_cov_prec: Float32[Array, 'k k'] | None,
     sigma_mu2: Float32[Array, ''] | None,
     sigma_mu2_cov: Float32[Array, 'k k'] | None,
     move_precs: Precs | Counts,
 ) -> tuple[PreLkV, PreLk]:
     is_multivariate = (
-        sigma2_cov is not None and sigma_mu2_cov is not None
+        sigma2_cov_prec is not None and sigma_mu2_cov is not None
         # and sigma2_cov.ndim == 2
         # and sigma_mu2_cov.ndim == 2
     )
     # jax.debug.print("sigma2_cov in precompute likelihood terms = {}", sigma2_cov)
     if is_multivariate:
         return precompute_likelihood_terms_multivariate(
-            sigma2_cov, sigma_mu2_cov, move_precs
+            sigma2_cov_prec, sigma_mu2_cov, move_precs
         )
     else:
         return precompute_likelihood_terms_univariate(sigma2, sigma_mu2, move_precs)
+
 
 def precompute_leaf_terms_univariate(
     key: Key[Array, ''],
@@ -2173,23 +2190,25 @@ def precompute_leaf_terms_univariate(
         centered_leaves=z * jnp.sqrt(var_post),
     )
 
+
 def precompute_leaf_terms_multivariate(
     key: Key[Array, ''],
     # For multivariate, prec_trees is just the count of points in each leaf (count_trees)
     prec_trees: Int32[Array, 'num_trees 2**d'],
-    sigma2_cov: Float32[Array, 'k k'],
+    # sigma2_cov: Float32[Array, 'k k'],
+    sigma2_cov_prec: Float32[Array, 'k k'],
     leaf_prior_cov: Float32[Array, 'k k'],
 ) -> PreLf:
     """
     Pre-compute terms to sample leaves from their multivariate posterior.
     """
     num_trees, num_leaves = prec_trees.shape
-    k = sigma2_cov.shape[0]
+    k = sigma2_cov_prec.shape[0]
 
-    sigma2_cov_inv = jnp.linalg.inv(sigma2_cov)
+    # sigma2_cov_prec = jnp.linalg.inv(sigma2_cov)
     leaf_prior_cov_inv = jnp.linalg.inv(leaf_prior_cov)
     n_k = prec_trees[..., None, None]  # Shape: [num_trees, num_leaves, 1, 1]
-    posterior_precision = leaf_prior_cov_inv + n_k * sigma2_cov_inv
+    posterior_precision = leaf_prior_cov_inv + n_k * sigma2_cov_prec
     var_post = jnp.linalg.inv(posterior_precision)
 
     z = random.normal(key, (num_trees, num_leaves, k))
@@ -2197,23 +2216,25 @@ def precompute_leaf_terms_multivariate(
     centered_leaves = (L @ z[..., None]).squeeze(-1)
 
     return PreLf(
-        mean_factor=var_post @ sigma2_cov_inv,  # Shape: [num_trees, num_leaves, k, k]
+        mean_factor=var_post @ sigma2_cov_prec,  # Shape: [num_trees, num_leaves, k, k]
         centered_leaves=centered_leaves,  # Shape: [num_trees, num_leaves, k]
     )
+
 
 def precompute_leaf_terms(
     key: Key[Array, ''],
     prec_trees: Float32[Array, 'num_trees 2**d'],
     sigma2: Float32[Array, ''] | None,
-    sigma2_cov: Float32[Array, 'k k'] | None,
+    # sigma2_cov: Float32[Array, 'k k'] | None,
+    sigma2_cov_prec: Float32[Array, 'k k'] | None,
     sigma_mu2: Float32[Array, ''] | None,
     leaf_prior_cov: Float32[Array, 'k k'] | None,
 ) -> PreLf:
-    is_multivariate = sigma2_cov is not None
+    is_multivariate = sigma2_cov_prec is not None
 
     if is_multivariate:
         return precompute_leaf_terms_multivariate(
-            key, prec_trees, sigma2_cov, leaf_prior_cov
+            key, prec_trees, sigma2_cov_prec, leaf_prior_cov
         )
     else:
         return precompute_leaf_terms_univariate(key, prec_trees, sigma2, sigma_mu2)
@@ -2555,7 +2576,6 @@ def compute_likelihood_ratio_multivariate(
     prelkv: PreLkV,
     prelk: PreLk,
 ) -> Float32[Array, '']:
-    
     def _quadratic_form(r, cov):
         # return r.T @ jnp.linalg.solve(cov, r)
         return r.T @ cov @ r
@@ -2710,44 +2730,106 @@ def step_sigma(key: Key[Array, ''], bart: State) -> State:
     return replace(bart, sigma2=beta / sample)
 
 
-def _wishart_bartlett(
-    key: Key[Array, ''], df: int, scale_inv: Float32[Array, 'k k']
+# def _wishart_bartlett(
+#     key: Key[Array, ''], df: int, scale_inv: Float32[Array, 'k k']
+# ) -> Float32[Array, 'k k']:
+#     """
+#     Bartlett decomposition: sample W ~ Wishart(df, scale_inv)
+#     where scale_inv is *the inverse* of the desired scale matrix.
+#     """
+#     k = scale_inv.shape[0]
+#     L = jnp.linalg.cholesky(scale_inv)
+
+#     key, diag_key, offdiag_key = random.split(key, 3)
+
+#     # Diagonal elements: A_ii ~ sqrt(chi^2(df - i))
+#     # chi^2(k) = Gamma(k/2, scale=2)
+#     df_vector = df - jnp.arange(k)
+#     chi2_samples = random.gamma(diag_key, df_vector / 2.0) * 2.0
+#     diag_A = jnp.sqrt(chi2_samples)
+
+#     off_diag_A = random.normal(offdiag_key, (k, k))
+#     A = jnp.tril(off_diag_A, -1) + jnp.diag(diag_A)
+
+#     return L @ A @ A.T @ L.T
+
+def _sample_wishart_bartlett(
+    key: Key[Array, ''], 
+    df: int, 
+    inv_wishart_scale: Float32[Array, 'k k']
 ) -> Float32[Array, 'k k']:
     """
-    Bartlett decomposition: sample W ~ Wishart(df, scale_inv)
-    where scale_inv is *the inverse* of the desired scale matrix.
+    Samples a precision matrix W ~ Wishart(df, V) where V = inv_wishart_scale^{-1}.
+
+    This function implements the Bartlett decomposition efficiently. It takes the
+    scale matrix from the *Inverse-Wishart* distribution (the `cov_scale` in the 
+    Gibbs update) and computes a sample of the *precision matrix* W without 
+    performing any explicit, expensive matrix inversions.
+
+    Args:
+        key: A JAX random key.
+        df: The degrees of freedom for the Wishart distribution.
+        inv_wishart_scale: The scale matrix of the corresponding Inverse-Wishart
+                           distribution, S. This is NOT the scale matrix of the
+                           Wishart distribution itself.
+
+    Returns:
+        A sample of the precision matrix, W.
     """
-    k = scale_inv.shape[0]
-    L = jnp.linalg.cholesky(scale_inv)
+    k = inv_wishart_scale.shape[0]
 
-    key, diag_key, offdiag_key = random.split(key, 3)
-
-    # Diagonal elements: A_ii ~ sqrt(chi^2(df - i))
-    # chi^2(k) = Gamma(k/2, scale=2)
+    L = jnp.linalg.cholesky(inv_wishart_scale)
+    diag_key, offdiag_key = random.split(key)
+    
+    # Diagonals are sqrt of chi-squared samples
     df_vector = df - jnp.arange(k)
     chi2_samples = random.gamma(diag_key, df_vector / 2.0) * 2.0
     diag_A = jnp.sqrt(chi2_samples)
-
+    
+    # Off-diagonals are standard normal
     off_diag_A = random.normal(offdiag_key, (k, k))
     A = jnp.tril(off_diag_A, -1) + jnp.diag(diag_A)
+    
+    # 3. Efficiently compute C = (L^T)⁻¹ @ A using a triangular solve.
+    # This is the "linalg magic" step that avoids a full inversion.
+    # We are solving the system L.T @ C = A for C.
+    C = solve_triangular(L, A, lower=True, trans='T')
+    
+    # 4. The final precision matrix sample is W = C @ C.T
+    prec_sample = C @ C.T
+    
+    return prec_sample
 
-    return L @ A @ A.T @ L.T
+# def step_sigma2_cov(key: Key[Array, ''], bart: State) -> State:
+#     """
+#     Gibbs update of the k×k error covariance given an Inv-Wishart prior.
+#     # The posterior is IW(t_n, s_nresid) where:
+#     # t_n = t_0 + n
+#     # s_n = s_0 + R'R
+#     """
+#     n, k = bart.resid.shape
+#     t_n = bart.sigma2_cov_prior_df + n
+#     s_n = bart.sigma2_cov_prior_scale + bart.resid.T @ bart.resid
 
-def step_sigma2_cov(key: Key[Array, ''], bart: State) -> State:
+#     W = _wishart_bartlett(key, t_n, jnp.linalg.inv(s_n))
+#     Sigma = jnp.linalg.inv(W)
+
+#     return replace(bart, sigma2_cov=Sigma)
+
+def step_sigma2_prec(key: Key[Array, ''], bart: State) -> State:
     """
-    Gibbs update of the k×k error covariance given an Inv-Wishart prior.
-    # The posterior is IW(t_n, s_nresid) where:
-    # t_n = t_0 + n
-    # s_n = s_0 + R'R
+    Gibbs update for the error precision matrix Σ⁻¹ using a Wishart posterior.
+    Prior: \Sigma ~ Inv-Wishart(df_0, S_0).i.e. \Sigma^{-1} ~ Wishart(df_0 , S_0^{-1})
+    Posterior: \Sigma ~ Inv-Wishart(df_0 + n, S_0 + R@R^T). i.e. \Sigma^{-1} ~ Wishart(df_0 + n, (S_0 + R@R^T)^{-1})
+    This function samples the precision Σ⁻¹ directly, by passing S₀ + R Rᵀ to the sampler.
     """
     n, k = bart.resid.shape
-    t_n = bart.sigma2_cov_prior_df + n
-    s_n = bart.sigma2_cov_prior_scale + bart.resid.T @ bart.resid
+    df_post = bart.sigma2_cov_prior_df + n
+    scale_post = bart.sigma2_cov_prior_scale + bart.resid.T @ bart.resid
 
-    W = _wishart_bartlett(key, t_n, jnp.linalg.inv(s_n))
-    Sigma = jnp.linalg.inv(W)
+    prec = _sample_wishart_bartlett(key, df_post, scale_post)
+    return replace(bart, sigma2_cov_prec = prec) # now this holds precision, not covariance
 
-    return replace(bart, sigma2_cov=Sigma)
 
 def step_z(key: Key[Array, ''], bart: State) -> State:
     """

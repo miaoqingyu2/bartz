@@ -132,7 +132,7 @@ print("data.X_test.shape", data.X_test.shape)
 
 X_test_treated = data.X_test.at[0, :].set(1)
 X_test_control = data.X_test.at[0, :].set(0)
-print('X_test_treated is now:',X_test_treated)
+# print('X_test_treated is now:',X_test_treated)
 ate_test = bart.predict(X_test_treated) - bart.predict(X_test_control)
 
 print(ate_test.shape)

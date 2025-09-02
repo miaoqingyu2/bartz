@@ -312,6 +312,7 @@ class mc_gbart(Module):
         b: FloatLike = 1.0,
         t0: FloatLike | None = None,  # Degrees of freedom for Inverse-Wishart
         s0: Float[Array, 'k k'] | None = None,  # Scale matrix for Inverse-Wishart
+        s0_inv: Float[Array, 'k k'] | None = None,  # precision matrix for Inverse-Wishart
         rho: FloatLike | None = None,
         xinfo: Float[Array, 'p n'] | None = None,
         usequants: bool = False,
@@ -392,6 +393,7 @@ class mc_gbart(Module):
             sigdf,
             t0,
             s0,
+            s0_inv,
             power,
             base,
             maxdepth,
@@ -526,6 +528,40 @@ class mc_gbart(Module):
 
         _, nskip = self._burnin_trace.grow_prop_count.shape
         return self.sigma2_cov[nskip:, ...].mean(axis=0)  # shape: [k, k]
+
+    @cached_property
+    def sigma2_cov_prec(
+        self,
+    ) -> (
+        Float32[Array, 'nskip+ndpost k k']
+        | Float32[Array, 'nskip+ndpost/mc_cores mc_cores k k']
+        | None
+    ):
+        """Error covariance matrices across iterations, including burn-in."""
+        if self._burnin_trace.sigma2_cov_prec is None:
+            return None
+        assert self._main_trace.sigma2_cov_prec is not None
+
+        # stack burn-in and post-burnin traces
+        sigma2_cov_prec = jnp.concatenate(
+            [self._burnin_trace.sigma2_cov_prec, self._main_trace.sigma2_cov_prec],
+            axis=1,  # assumes [chain, iteration, k, k]
+        )
+        sigma2_cov_prec = sigma2_cov_prec.transpose(1, 0, 2, 3)  # shape: [n_total, chain, k, k]
+        if sigma2_cov_prec.shape[1] == 1:
+            sigma2_cov_prec = sigma2_cov_prec.squeeze(1)  # shape: [n_total, k, k]
+
+        return sigma2_cov_prec
+
+    @cached_property
+    def sigma2_cov_prec_mean(self) -> Float32[Array, 'k k'] | None:
+        """Mean of `sigma2_cov`, over post-burnin samples."""
+        if self.sigma2_cov_prec is None:
+            return None
+
+        _, nskip = self._burnin_trace.grow_prop_count.shape
+        return self.sigma2_cov_prec[nskip:, ...].mean(axis=0)  # shape: [k, k]
+
 
     @cached_property
     def varcount(self) -> Int32[Array, 'ndpost p']:
@@ -874,6 +910,7 @@ class mc_gbart(Module):
         sigdf: FloatLike,
         t0: FloatLike | None,
         s0: Float[Array, 'd d'] | None,
+        s0_inv: Float[Array, 'd d'] | None,
         power: FloatLike,
         base: FloatLike,
         maxdepth: int,
@@ -925,6 +962,7 @@ class mc_gbart(Module):
             # Multivariate continuous case
             kw['sigma2_cov_prior_df'] = t0
             kw['sigma2_cov_prior_scale'] = s0
+            kw['inv_sigma2_cov_prior_scale'] = s0_inv
             kw['sigma_mu2_cov'] = jnp.square(sigma_mu)
             kw['sigma_mu2'] = jnp.square(sigma_mu)  # place holder?
 
