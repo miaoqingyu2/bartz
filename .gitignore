@@ -5,3 +5,5 @@ dist/
 .venv/
 uv.lock
 data/
+test_*.py
+test_*.ipynb
