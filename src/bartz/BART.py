@@ -734,40 +734,137 @@ class mc_gbart(Module):
             invchi2rid = invchi2 * sigdf
             return sigest2 / invchi2rid, jnp.sqrt(sigest2)
 
+    # @staticmethod
+    # def _process_error_variance_matrix_settings(
+    #     x_train: Real[Array, 'p n'],
+    #     y_train: Float32[Array, 'n k'],
+    #     sigest: Float32[Array, 'k'] | None,  # Can now be a vector
+    #     sigdf: float,
+    #     sigquant: float,
+    #     lamda: Float32[Array, 'k'] | None,  # Can now be a vector
+    #     t0: float | None,
+    #     s0: Float32[Array, 'k k'] | None,
+    # ) -> tuple[float, Float32[Array, 'k k']]:
+    #     n_obs = x_train.shape[1]
+    #     n_preds = x_train.shape[0]
+    #     n_outcomes = y_train.shape[1]
+
+    #     if t0 is None:
+    #         # t0 = float(n_outcomes + 1/2)
+    #         t0 = float(sigdf + n_outcomes - 1)
+    #     if t0 <= n_outcomes - 1:
+    #         raise ValueError(f'Degrees of freedom `t0` must be > {n_outcomes - 1}')
+
+    #     if s0 is not None:
+    #         if s0.shape != (n_outcomes, n_outcomes):
+    #             raise ValueError(
+    #                 f'Scale matrix `s0` must have shape ({n_outcomes}, {n_outcomes})'
+    #             )
+    #         return jnp.asarray(t0, dtype=jnp.float32), jnp.asarray(s0)
+
+    #     if lamda is not None:
+    #         # From the IW-IG relationship, s0_ii = 2 * lamda_i
+    #         s0 = jnp.diag(2.0 * jnp.asarray(lamda))
+    #         return jnp.asarray(t0, dtype=jnp.float32), s0
+
+    #     # --- Vectorized logic to calculate s0 from scratch ---
+    #     if sigest is not None:
+    #         sigest2_vec = jnp.square(sigest)
+    #     elif n_obs < 2:
+    #         sigest2_vec = jnp.ones(n_outcomes)
+    #     elif n_obs <= n_preds:
+    #         sigest2_vec = jnp.var(y_train, axis=0)
+    #     else:
+    #         x_centered = x_train.T - x_train.mean(axis=1)
+    #         y_centered = y_train - y_train.mean(axis=0)
+    #         _, chisq_vec, rank, _ = jnp.linalg.lstsq(x_centered, y_centered)
+    #         dof = n_obs - rank
+    #         sigest2_vec = chisq_vec / dof
+
+    #     alpha = sigdf / 2.0
+    #     invchi2 = invgamma.ppf(sigquant, alpha) / 2.0
+    #     invchi2rid = invchi2 * sigdf
+    #     lamda_vec = jnp.atleast_1d(sigest2_vec / invchi2rid)
+
+    #     s0 = jnp.diag(t0 * lamda_vec)
+    #     s0_inv = jnp.diag(1 / (t0 * lamda_vec))
+    #     return jnp.asarray(t0, dtype=jnp.float32), s0, s0_inv
+
     @staticmethod
     def _process_error_variance_matrix_settings(
         x_train: Real[Array, 'p n'],
         y_train: Float32[Array, 'n k'],
-        sigest: Float32[Array, 'k'] | None,  # Can now be a vector
+        sigest: Float32[Array, 'k'] | None,
         sigdf: float,
         sigquant: float,
-        lamda: Float32[Array, 'k'] | None,  # Can now be a vector
+        lamda: Float32[Array, 'k'] | None,
         t0: float | None,
         s0: Float32[Array, 'k k'] | None,
-    ) -> tuple[float, Float32[Array, 'k k']]:
+        *,
+        use_empirical_s0: bool = True,       # NEW
+        shrinkage_eta: float | None = None,   # NEW: in [0,1]
+        jitter: float = 1e-6                  # NEW
+    ) -> tuple[float, Float32[Array, 'k k'], Float32[Array, 'k k']]:  # NOTE: now returns s0_inv too
         n_obs = x_train.shape[1]
         n_preds = x_train.shape[0]
         n_outcomes = y_train.shape[1]
 
+        jax.debug.print('using updated initialziation on s0')
+        # Degrees of freedom (ν0)
         if t0 is None:
-            # t0 = float(n_outcomes + 1/2)
             t0 = float(sigdf + n_outcomes - 1)
         if t0 <= n_outcomes - 1:
             raise ValueError(f'Degrees of freedom `t0` must be > {n_outcomes - 1}')
 
+        # If user passed s0 explicitly, honor it
         if s0 is not None:
             if s0.shape != (n_outcomes, n_outcomes):
-                raise ValueError(
-                    f'Scale matrix `s0` must have shape ({n_outcomes}, {n_outcomes})'
-                )
-            return jnp.asarray(t0, dtype=jnp.float32), jnp.asarray(s0)
+                raise ValueError(f'Scale matrix `s0` must have shape ({n_outcomes}, {n_outcomes})')
+            s0 = jnp.asarray(s0, dtype=jnp.float32)
+            s0 = s0 + jitter * jnp.eye(n_outcomes, dtype=jnp.float32)
+            s0_inv = jnp.linalg.inv(s0)
+            return jnp.asarray(t0, dtype=jnp.float32), s0, s0_inv
 
-        if lamda is not None:
-            # From the IW-IG relationship, s0_ii = 2 * lamda_i
+        # If lamda (vector) supplied, keep your diagonal IW-IG construction
+        if lamda is not None and (not use_empirical_s0):
             s0 = jnp.diag(2.0 * jnp.asarray(lamda))
-            return jnp.asarray(t0, dtype=jnp.float32), s0
+            s0 = s0 + jitter * jnp.eye(n_outcomes, dtype=jnp.float32)
+            s0_inv = jnp.linalg.inv(s0)
+            return jnp.asarray(t0, dtype=jnp.float32), s0, s0_inv
 
-        # --- Vectorized logic to calculate s0 from scratch ---
+        # === New path: empirical (residual) covariance for off-diagonals ===
+        if use_empirical_s0 and (n_obs >= 2):
+            # Center X and Y
+            jax.debug.print('using empirical s0 in initialization!')
+            x_centered = x_train.T - x_train.mean(axis=1)
+            y_centered = y_train - y_train.mean(axis=0)
+
+            # Least-squares fit to get residuals matrix R (shape n x k)
+            # jnp.linalg.lstsq returns (coef, residuals, rank, s)
+            coef, _, rank, _ = jnp.linalg.lstsq(x_centered, y_centered, rcond=None)
+            R = y_centered - x_centered @ coef
+            dof = jnp.maximum(1, n_obs - rank)
+
+            # Empirical residual covariance S_emp = R^T R / dof
+            S_emp = (R.T @ R) / dof
+
+            # Optional shrinkage toward the diagonal
+            if shrinkage_eta is not None:
+                eta = jnp.clip(jnp.asarray(shrinkage_eta), 0.0, 1.0)
+                S_diag = jnp.diag(jnp.diag(S_emp))
+                S_star = (1.0 - eta) * S_diag + eta * S_emp
+            else:
+                S_star = S_emp
+
+            # Map desired center S_star to IW scale S0: S0 = (t0 - k - 1) * S_star
+            S0 = (t0 - n_outcomes - 1.0) * S_star
+
+            # Safety: ensure PD
+            S0 = S0 + jitter * jnp.eye(n_outcomes, dtype=jnp.float32)
+            s0_inv = jnp.linalg.inv(S0)
+            return jnp.asarray(t0, dtype=jnp.float32), S0.astype(jnp.float32), s0_inv.astype(jnp.float32)
+
+        # --- Fallback: your original diagonal construction ---
         if sigest is not None:
             sigest2_vec = jnp.square(sigest)
         elif n_obs < 2:
@@ -786,8 +883,9 @@ class mc_gbart(Module):
         invchi2rid = invchi2 * sigdf
         lamda_vec = jnp.atleast_1d(sigest2_vec / invchi2rid)
 
-        s0 = jnp.diag(t0 * lamda_vec)
-        s0_inv = jnp.diag(1 / (t0 * lamda_vec))
+        s0 = jnp.diag(t0 * lamda_vec).astype(jnp.float32)
+        s0 = s0 + jitter * jnp.eye(n_outcomes, dtype=jnp.float32)
+        s0_inv = jnp.linalg.inv(s0)
         return jnp.asarray(t0, dtype=jnp.float32), s0, s0_inv
 
     @staticmethod
