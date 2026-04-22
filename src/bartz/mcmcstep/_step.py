@@ -27,11 +27,10 @@
 from dataclasses import replace
 from functools import partial
 
+# WORKAROUND(jax<0.6.1): shard_map was promoted from jax.experimental to top-level in 0.6.1
 try:
-    # available since jax v0.6.1
     from jax import shard_map
 except ImportError:
-    # deprecated in jax v0.8.0
     from jax.experimental.shard_map import shard_map
 
 import jax
@@ -72,16 +71,14 @@ def step(key: Key[Array, ''], bart: State) -> State:
     state can not be used any more after calling `step`. All this applies
     outside of `jax.jit`.
     """
-    keys = split(key, 3)
+    keys = split(key, 4)
 
-    if bart.y.dtype == bool:
-        bart = replace(bart, error_cov_inv=jnp.array(1.0))
-        bart = step_trees(keys.pop(), bart)
-        bart = replace(bart, error_cov_inv=None)
+    bart = step_trees(keys.pop(), bart)
+
+    if bart.z is not None:
         bart = step_z(keys.pop(), bart)
 
-    else:  # continuous or multivariate regression
-        bart = step_trees(keys.pop(), bart)
+    if bart.error_cov_df is not None:
         bart = step_error_cov_inv(keys.pop(), bart)
 
     bart = step_sparse(keys.pop(), bart)
@@ -367,7 +364,6 @@ def accept_moves_parallel_stage(
         ),
     )
 
-    assert bart.error_cov_inv is not None
     prelkv, prelk = precompute_likelihood_terms(
         bart.error_cov_inv, bart.forest.leaf_prior_cov_inv, move_precs
     )
@@ -1147,8 +1143,8 @@ def _scatter_add(
 
 
 def _get_shard_map_patch_kwargs() -> dict[str, bool]:
-    # see jax/issues/#34249, problem with vmap(shard_map(psum))
-    # we tried the config jax_disable_vmap_shmap_error but it didn't work
+    # WORKAROUND(jax<=0.8.2): vmap(shard_map(psum)), jax#34249; the
+    # jax_disable_vmap_shmap_error config did not work
     if jax.__version__ in ('0.8.1', '0.8.2'):
         return {'check_vma': False}
     else:
@@ -1386,6 +1382,9 @@ def _sample_wishart_bartlett(
 
 
 def _step_error_cov_inv_uv(key: Key[Array, ''], bart: State) -> State:
+    assert bart.error_cov_df is not None
+    assert bart.error_cov_scale is not None
+
     resid = bart.resid
     # inverse gamma prior: alpha = df / 2, beta = scale / 2
     alpha = bart.error_cov_df / 2 + resid.size / 2
@@ -1403,6 +1402,9 @@ def _step_error_cov_inv_uv(key: Key[Array, ''], bart: State) -> State:
 
 
 def _step_error_cov_inv_mv(key: Key[Array, ''], bart: State) -> State:
+    assert bart.error_cov_df is not None
+    assert bart.error_cov_scale is not None
+
     n = bart.resid.shape[-1]
     df_post = bart.error_cov_df + n
     scale_post = bart.error_cov_scale + bart.resid @ bart.resid.T
@@ -1411,13 +1413,42 @@ def _step_error_cov_inv_mv(key: Key[Array, ''], bart: State) -> State:
     return replace(bart, error_cov_inv=prec)
 
 
+def _step_error_cov_inv_diag(key: Key[Array, ''], bart: State) -> State:
+    """Update diagonal error_cov_inv for mixed binary-continuous.
+
+    Each continuous component gets an independent inverse-gamma update
+    (like `_step_error_cov_inv_uv` repeated per component). Binary
+    components stay fixed at 1.
+    """
+    assert bart.binary_indices is not None
+    assert bart.error_cov_scale is not None
+    assert bart.error_cov_df is not None
+
+    # per-component sum of squared residuals, shape (k,)
+    norm2 = jnp.einsum('kn,kn->k', bart.resid, bart.resid)
+
+    # inverse-gamma posterior parameters
+    *_, k, n = bart.resid.shape
+    scale_diag = jnp.diag(bart.error_cov_scale)
+    alpha = bart.error_cov_df / 2 + n / 2
+    beta = scale_diag / 2 + norm2 / 2
+
+    # sample independent gamma variates for all k components
+    samples = random.gamma(key, alpha, (k,))
+    new_diag = samples / beta
+
+    # keep binary components at 1.0
+    new_diag = new_diag.at[bart.binary_indices].set(1.0)
+
+    return replace(bart, error_cov_inv=jnp.diag(new_diag))
+
+
 @named_call
 def step_error_cov_inv(key: Key[Array, ''], bart: State) -> State:
     """
     MCMC-update the inverse error covariance.
 
-    Handles both univariate and multivariate cases based on the BART state's
-    `kind` attribute.
+    Handles univariate, multivariate, and mixed binary-continuous cases.
 
     Parameters
     ----------
@@ -1430,8 +1461,9 @@ def step_error_cov_inv(key: Key[Array, ''], bart: State) -> State:
     -------
     The new BART mcmc state, with an updated `error_cov_inv`.
     """
-    assert bart.error_cov_inv is not None
-    if bart.error_cov_inv.ndim == 2:
+    if bart.binary_indices is not None:
+        return _step_error_cov_inv_diag(key, bart)
+    elif bart.error_cov_inv.ndim == 2:
         return _step_error_cov_inv_mv(key, bart)
     else:
         return _step_error_cov_inv_uv(key, bart)
@@ -1453,10 +1485,21 @@ def step_z(key: Key[Array, ''], bart: State) -> State:
     -------
     The updated BART MCMC state.
     """
-    trees_plus_offset = bart.z - bart.resid
-    assert bart.y.dtype == bool
-    resid = truncated_normal_onesided(key, (), ~bart.y, -trees_plus_offset)
+    assert bart.z is not None
+    assert bart.binary_y is not None
+
+    if bart.binary_indices is not None:
+        resid = bart.resid[..., bart.binary_indices, :]
+    else:
+        resid = bart.resid
+
+    trees_plus_offset = bart.z - resid
+    resid = truncated_normal_onesided(key, (), ~bart.binary_y, -trees_plus_offset)
     z = trees_plus_offset + resid
+
+    if bart.binary_indices is not None:
+        resid = bart.resid.at[..., bart.binary_indices, :].set(resid)
+
     return replace(bart, z=z, resid=resid)
 
 

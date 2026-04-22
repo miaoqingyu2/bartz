@@ -45,21 +45,29 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SKIP: no-commit-to-branch
+      RPY2_CFFI_MODE: ABI
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
+      # this python is for the pre-commit action
       - uses: actions/setup-python@v6
         with:
           python-version-file: ".python-version"
+
+      # this python is for the pre-commit hooks
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
 
       - name: Determine base ref
         id: refs
         run: echo "from=${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (startsWith(github.ref, 'refs/heads/') && github.event.before) || '' }}" >> "$GITHUB_OUTPUT"
 
       - name: Run pre-commit on changed files
-        # even if I run it on all files below, it's convenient to see if something fails in new changes first
+        # even if we run it on all files below, it's convenient to see if something fails in new changes first
         if: steps.refs.outputs.from != ''
         uses: pre-commit/action@v3.0.1
         with:
@@ -89,20 +97,14 @@ jobs:
             {
               "id": "latest",
               "runs-on": "ubuntu-latest",
-              "target-suffix": "",
-              "tests-args": ""
-            },
-            {
-              "id": "old",
-              "runs-on": "ubuntu-22.04",
-              "target-suffix": "-old",
-              "tests-args": ""
+              "argv": "tests",
+              "ARGS": "--disable-problematic-sharding"
             },
             {
               "id": "single-cpu",
               "runs-on": "ubuntu-latest",
-              "target-suffix": "",
-              "tests-args": "ARGS=--num-cpu-devices=1"
+              "argv": "tests COVERAGE_SUFFIX=-single-cpu",
+              "ARGS": "--num-cpu-devices=1"
             }
           ]'
           BENCHMARKS_BASE_MATRIX='[
@@ -128,7 +130,9 @@ jobs:
     name: tests-${{ matrix.id }}
     needs: setup-matrix
     runs-on: ${{ matrix.runs-on }}
-    continue-on-error: ${{ matrix.target-suffix == '-gpu' }}
+
+    env:
+      RPY2_CFFI_MODE: ${{ github.event_name == 'pull_request' && 'ABI' || '' }}
 
     strategy:
       fail-fast: false
@@ -145,16 +149,19 @@ jobs:
           cache-suffix: -${{ matrix.id }}
 
       - name: Install R
+        if: github.event_name != 'pull_request'
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: "renv"
 
       - name: Install R dependencies
+        if: github.event_name != 'pull_request'
         uses: r-lib/actions/setup-renv@v2
         env:
           GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure R PATHS for rpy2 (Linux only)
+        if: github.event_name != 'pull_request'
         run: |
           echo "R_HOME=$(R RHOME)" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$(R RHOME)/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
@@ -162,14 +169,14 @@ jobs:
           uv run --dev python -c "import rpy2.situation as s; print('\n'.join(map(str, s.iter_info())))"
 
       - name: Run unit tests
-        timeout-minutes: 30
-        run: make COVERAGE_SUFFIX=-${{ matrix.id }} tests${{ matrix.target-suffix }} ${{ matrix.tests-args }}
+        timeout-minutes: 120
+        run: make ${{ matrix.argv }} ARGS='${{ matrix.ARGS }}${{ github.event_name == 'pull_request' && ' -m "not slow"' || '' }}'
 
       - name: Save coverage information
         uses: actions/upload-artifact@v7
         with:
-          name: coverage.tests-${{ matrix.id }}
-          path: .coverage.tests-${{ matrix.id }}
+          archive: false # the artifact name is equal to the file name
+          path: .coverage*
           include-hidden-files: true
           if-no-files-found: error
 
@@ -197,7 +204,7 @@ jobs:
         run: RPY2_CFFI_MODE=ABI make asv-publish
 
       - name: Generate documentation
-        run: make docs docs-latest
+        run: RPY2_CFFI_MODE=ABI make docs docs-latest
 
       - name: Save documentation
         uses: actions/upload-artifact@v7
@@ -225,8 +232,13 @@ jobs:
       - name: Get coverage files
         uses: actions/download-artifact@v8
         with:
-          pattern: coverage.*
+          pattern: .coverage*
           merge-multiple: true
+
+      - name: Exclude slow-only code from coverage
+        # slow tests are skipped on PRs, don't count them for coverage
+        if: github.event_name == 'pull_request'
+        run: 'sed -i ''/^\[tool.coverage.report\]$/a exclude_also = ["# pragma: slow"]\nomit = ["src/bartz/debug/_traceconv.py"]'' pyproject.toml'
 
       - name: List files
         run: |
@@ -251,7 +263,7 @@ jobs:
           if-no-files-found: error
 
       - name: Check coverage threshold
-        run: make covcheck
+        run: make covcheck ${{ github.event_name == 'pull_request' && 'ARGS=--fail-under=90' || '' }}
 
   deploy:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
@@ -270,9 +282,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag commit is on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main \
+            || { echo "Tag commit is not on main branch"; exit 1; }
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Get documentation and benchmarks
         uses: actions/download-artifact@v8
@@ -297,13 +318,12 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   benchmarks:
     name: benchmarks-${{ matrix.id }}
     needs: setup-matrix
     runs-on: ${{ matrix.runs-on }}
-    continue-on-error: ${{ matrix.target-suffix == '-gpu' }}
 
     strategy:
       fail-fast: false
@@ -346,6 +366,12 @@ jobs:
 
       - name: Update package version
         run: make copy-version
+
+      - name: Update locked dependencies
+        run: make update-deps
+
+      - name: Bump oldest supported dependencies
+        run: make update-oldest-deps
 
   required-dummy:
     runs-on: ubuntu-latest

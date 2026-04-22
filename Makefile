@@ -32,8 +32,14 @@ EXTRAS = $(if $(filter 12 13,$(CUDA_VERSION)),--extra=cuda$(CUDA_VERSION),)
 UV_RUN = uv run --dev $(EXTRAS)
 
 # define command to run python with oldest supported dependencies
+# OLD_DATE / OLD_DELAY_DAYS / BUMP_PYTHON_VERSION_DATE / NUM_SUPPORTED_PYTHON_RELEASES
+# drive the `update-oldest-deps` policy.
+OLD_DATE = 2025-05-15
+OLD_DELAY_DAYS = 365
+BUMP_PYTHON_VERSION_DATE = 10-31
+NUM_SUPPORTED_PYTHON_RELEASES = 5
 OLD_PYTHON = $(shell grep 'requires-python' pyproject.toml | sed 's/.*>=\([0-9.]*\).*/\1/')
-UV_RUN_OLD = $(UV_RUN) --python=$(OLD_PYTHON) --resolution=lowest-direct --exclude-newer=2025-05-15 --isolated
+UV_RUN_OLD = $(UV_RUN) --python=$(OLD_PYTHON) --resolution=lowest-direct --exclude-newer=$(OLD_DATE) --isolated
 
 .PHONY: help
 help:
@@ -48,12 +54,14 @@ help:
 	@echo "- covreport: build html coverage report"
 	@echo "- covcheck: check coverage is above some thresholds"
 	@echo "- update-deps: remove .venv, upgrade uv.lock, update pre-commit hooks"
+	@echo "- update-oldest-deps: advance OLD_DATE and refresh oldest-supported pins in pyproject.toml"
 	@echo "- copy-version: sync version from pyproject.toml to _version.py"
 	@echo "- check-committed: verify there are no uncommitted changes"
 	@echo "- release: packages the python module, invokes tests and docs first"
 	@echo "- version-tag: create and push git tag for current version"
 	@echo "- upload: upload release to PyPI"
 	@echo "- upload-test: upload release to TestPyPI"
+	@echo "- asv-machine: initialize ~/.asv-machine.json with a human-readable id"
 	@echo "- asv-run: run benchmarks on all unbenchmarked tagged releases and main"
 	@echo "- asv-publish: create html benchmark report"
 	@echo "- asv-preview: create html report and start server"
@@ -61,7 +69,14 @@ help:
 	@echo "- asv-quick: run quick benchmarks on current code, no saving"
 	@echo "- ipython: start an ipython shell with stuff pre-imported"
 	@echo "- ipython-old: start an ipython shell with oldest supported python and dependencies"
-	@echo "- lint: run the linter used in pre-commit"
+	@echo "- lint: run pre-commit hooks on all files"
+	@echo
+	@echo "Update dependencies workflow:"
+	@echo "- new PR"
+	@echo "- $$ make update-deps"
+	@echo "- $$ make tests  # and debug"
+	@echo "- $$ make update-oldest-deps"
+	@echo "- $$ make tests-old  # and debug"
 	@echo
 	@echo "Release workflow:"
 	@echo "- do a PR that re-runs benchmarks"
@@ -86,11 +101,11 @@ setup:
 
 .PHONY: lint
 lint:
-	$(UV_RUN) pre-commit run --all-files ruff-check
+	$(UV_RUN) pre-commit run --all-files
 
 ################# TESTS #################
 
-TESTS_VARS = COVERAGE_FILE=.coverage.tests$(COVERAGE_SUFFIX)
+TESTS_VARS = COVERAGE_FILE=.coverage.$@$(COVERAGE_SUFFIX)
 TESTS_COMMAND = python -m pytest --cov --cov-context=test --dist=worksteal --durations=1000
 TESTS_CPU_VARS = $(TESTS_VARS) JAX_PLATFORMS=cpu
 TESTS_CPU_COMMAND = $(TESTS_COMMAND) --platform=cpu --numprocesses=2
@@ -150,7 +165,7 @@ covcheck:
 	$(UV_RUN) coverage combine --keep
 	$(UV_RUN) coverage report --include='tests/**/test_*.py'
 	$(UV_RUN) coverage report --include='src/*'
-	$(UV_RUN) coverage report --include='tests/**/test_*.py' --fail-under=99 --format=total
+	$(UV_RUN) coverage report --include='tests/**/test_*.py' --fail-under=99 --format=total $(ARGS)
 	$(UV_RUN) coverage report --include='src/*' --fail-under=90 --format=total
 
 
@@ -160,6 +175,12 @@ covcheck:
 update-deps:
 	uv lock --upgrade
 	$(UV_RUN) pre-commit autoupdate
+
+.PHONY: update-oldest-deps
+update-oldest-deps:
+	$(UV_RUN) python config/update_python_version.py --bump-date=$(BUMP_PYTHON_VERSION_DATE) --num-supported=$(NUM_SUPPORTED_PYTHON_RELEASES)
+	$(UV_RUN) python config/update_oldest_deps.py --min-old-date=$(OLD_DATE) --delay-days=$(OLD_DELAY_DAYS)
+	uv lock
 
 .PHONY: copy-version
 copy-version: src/bartz/_version.py
@@ -184,9 +205,16 @@ release: clean update-deps copy-version check-committed tests tests-old docs
 
 .PHONY: version-tag
 version-tag: copy-version check-committed
+	test $(shell git rev-parse --abbrev-ref HEAD) = main
 	git fetch --tags
 	$(eval VERSION_TAG := v$(shell uv run python -c 'import bartz; print(bartz.__version__)'))
-	git tag $(VERSION_TAG)
+	@if git rev-parse -q --verify refs/tags/$(VERSION_TAG) >/dev/null; then \
+		test "$$(git rev-list -n 1 $(VERSION_TAG))" = "$$(git rev-parse HEAD)" \
+			|| { echo "Tag $(VERSION_TAG) exists but points to a different commit"; exit 1; }; \
+		echo "Tag $(VERSION_TAG) already exists on current commit"; \
+	else \
+		git tag --message=$(VERSION_TAG) $(VERSION_TAG); \
+	fi
 	git push origin $(VERSION_TAG)
 
 .PHONY: smoke-test
@@ -219,8 +247,12 @@ upload-test: smoke-test check-committed
 
 ASV = $(UV_RUN) python -m asv
 
+.PHONY: asv-machine
+asv-machine:
+	$(UV_RUN) python config/asv_machine.py
+
 .PHONY: asv-run
-asv-run:
+asv-run: asv-machine
 	$(UV_RUN) python config/refs-for-asv.py | $(ASV) run --durations=all --skip-existing-successful --show-stderr HASHFILE:- $(ARGS)
 
 .PHONY: asv-publish
@@ -232,11 +264,11 @@ asv-preview: asv-publish
 	$(ASV) preview $(ARGS)
 
 .PHONY: asv-main
-asv-main:
+asv-main: asv-machine
 	$(ASV) run --show-stderr main^! $(ARGS)
 
 .PHONY: asv-quick
-asv-quick:
+asv-quick: asv-machine
 	$(ASV) run --durations=all --python=same --quick --dry-run --show-stderr $(ARGS)
 
 
